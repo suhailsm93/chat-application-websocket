@@ -1,11 +1,16 @@
 package com.chat.websocket.handler;
 
+import com.chat.common.ratelimit.RedisRateLimiter;
 import com.chat.common.util.UUIDv7Utils;
 import com.chat.conversation.repository.ConversationMemberRepository;
 import com.chat.message.model.MessageEntity;
 import com.chat.message.repository.MessageRepository;
+import com.chat.presence.service.PresenceService;
 import com.chat.websocket.dto.WebSocketFrames.*;
+import com.chat.websocket.registry.RedisConnectionRegistry;
+import com.chat.websocket.service.TypingIndicatorService;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -15,6 +20,7 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Map;
 import java.util.UUID;
@@ -28,31 +34,60 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final ObjectMapper objectMapper;
     private final MessageRepository messageRepository;
     private final ConversationMemberRepository memberRepository;
+    private final RedisConnectionRegistry connectionRegistry;
+    private final PresenceService presenceService;
+    private final TypingIndicatorService typingIndicatorService;
+    private final RedisRateLimiter rateLimiter;
 
-    // Local-only mapping for Phase 2: [userId -> [deviceId -> session]]
-    private final Map<UUID, Map<UUID, WebSocketSession>> activeSessions = new ConcurrentHashMap<>();
+    // Local sessions map: deviceId -> WebSocketSession
+    private final Map<UUID, WebSocketSession> localSessions = new ConcurrentHashMap<>();
+
+    @PostConstruct
+    public void registerPubSubListener() {
+        connectionRegistry.registerFrameSubscriber("local-handler", (nodeId, frameJson) -> {
+            try {
+                Frame frame = objectMapper.readValue(frameJson, Frame.class);
+                dispatchToLocalSession(frame);
+            } catch (Exception e) {
+                log.error("Error dispatching pub/sub frame locally: ", e);
+            }
+        });
+    }
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) {
         UUID userId = (UUID) session.getAttributes().get("userId");
         UUID deviceId = (UUID) session.getAttributes().get("deviceId");
 
-        activeSessions.computeIfAbsent(userId, k -> new ConcurrentHashMap<>()).put(deviceId, session);
-        log.info("WebSocket connected: User ID: {}, Device ID: {}", userId, deviceId);
+        localSessions.put(deviceId, session);
+        connectionRegistry.registerLocalConnection(userId, deviceId);
+        presenceService.heartbeat(userId);
+
+        log.info("WebSocket connection established. User: {}, Device: {}", userId, deviceId);
     }
 
     @Override
     protected void handleTextMessage(WebSocketSession session, TextMessage message) throws Exception {
         UUID userId = (UUID) session.getAttributes().get("userId");
+        presenceService.heartbeat(userId); // Refresh presence TTL on frame
+
+        // Rate limiting check: 30 frames per 10 seconds
+        if (!rateLimiter.isAllowed("ws:msg:" + userId, 30, Duration.ofSeconds(10))) {
+            sendError(session, null, "Rate limit exceeded. Please slow down.");
+            return;
+        }
+
         Frame frame = objectMapper.readValue(message.getPayload(), Frame.class);
 
         try {
             switch (frame.type()) {
                 case MESSAGE_SEND -> handleMessageSend(session, userId, frame);
-                default -> log.warn("Unsupported frame type in Phase 2: {}", frame.type());
+                case TYPING_START -> handleTyping(userId, frame, true);
+                case TYPING_STOP -> handleTyping(userId, frame, false);
+                default -> log.warn("Unhandled frame type: {}", frame.type());
             }
         } catch (Exception e) {
-            log.error("Error processing frame: ", e);
+            log.error("Error handling WS frame: ", e);
             sendError(session, frame.requestId(), e.getMessage());
         }
     }
@@ -60,7 +95,6 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private void handleMessageSend(WebSocketSession session, UUID senderId, Frame frame) throws IOException {
         MessageSendPayload payload = objectMapper.readValue(frame.payloadJson(), MessageSendPayload.class);
 
-        // Security check: Verify sender is a member of the conversation
         boolean isMember = memberRepository.existsById(
                 new com.chat.conversation.model.ConversationMember.ConversationMemberId(frame.conversationId(), senderId)
         );
@@ -68,11 +102,9 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             throw new IllegalArgumentException("User is not a member of this conversation.");
         }
 
-        // Generate time-sortable UUIDv7
         UUID messageId = UUIDv7Utils.generateUUIDv7();
         Instant now = Instant.now();
 
-        // Persist message directly (durable write-through)
         MessageEntity messageEntity = MessageEntity.builder()
                 .id(messageId)
                 .conversationId(frame.conversationId())
@@ -88,61 +120,75 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
         messageRepository.save(messageEntity);
 
-        // Return immediate MESSAGE_ACK to the sender
+        // Immediate ACK back to sender session
         MessageAckPayload ackPayload = new MessageAckPayload(
-                messageId,
-                frame.conversationId(),
-                payload.clientMessageId(),
-                now,
-                "SENT"
+                messageId, frame.conversationId(), payload.clientMessageId(), now, "SENT"
         );
-
         Frame ackFrame = new Frame(
-                FrameType.MESSAGE_ACK,
-                frame.requestId(),
-                frame.conversationId(),
-                objectMapper.writeValueAsString(ackPayload)
+                FrameType.MESSAGE_ACK, frame.requestId(), frame.conversationId(), objectMapper.writeValueAsString(ackPayload)
         );
-
         session.sendMessage(new TextMessage(objectMapper.writeValueAsString(ackFrame)));
-        
-        // Phase 2: Simple local delivery to online recipients (Kafka and Redis pub/sub are added in Phase 3/4)
-        deliverLocally(messageEntity);
+
+        // Route message across node cluster to recipient devices
+        broadcastToConversationMembers(messageEntity);
     }
 
-    private void deliverLocally(MessageEntity message) throws IOException {
-        memberRepository.findByConversationId(message.getConversationId()).forEach(member -> {
-            if (!member.getUserId().equals(message.getSenderId())) {
-                Map<UUID, WebSocketSession> devices = activeSessions.get(member.getUserId());
-                if (devices != null) {
-                    devices.values().forEach(session -> {
-                        try {
-                            if (session.isOpen()) {
-                                Frame newMsgFrame = new Frame(
-                                        FrameType.MESSAGE_NEW,
-                                        null,
-                                        message.getConversationId(),
-                                        objectMapper.writeValueAsString(message)
-                                );
-                                session.sendMessage(new TextMessage(objectMapper.writeValueAsString(newMsgFrame)));
-                            }
-                        } catch (IOException e) {
-                            log.error("Failed to push message locally: ", e);
-                        }
-                    });
-                }
+    private void handleTyping(UUID userId, Frame frame, boolean isTyping) throws IOException {
+        typingIndicatorService.setTyping(frame.conversationId(), userId, isTyping);
+        
+        Frame typingFrame = new Frame(
+                isTyping ? FrameType.TYPING_START : FrameType.TYPING_STOP,
+                null,
+                frame.conversationId(),
+                "{\"userId\":\"" + userId + "\"}"
+        );
+
+        memberRepository.findByConversationId(frame.conversationId()).forEach(member -> {
+            if (!member.getUserId().equals(userId)) {
+                routeToUserDevices(member.getUserId(), typingFrame);
             }
         });
     }
 
+    private void broadcastToConversationMembers(MessageEntity message) throws IOException {
+        Frame newMsgFrame = new Frame(
+                FrameType.MESSAGE_NEW, null, message.getConversationId(), objectMapper.writeValueAsString(message)
+        );
+
+        memberRepository.findByConversationId(message.getConversationId()).forEach(member -> {
+            if (!member.getUserId().equals(message.getSenderId())) {
+                routeToUserDevices(member.getUserId(), newMsgFrame);
+            }
+        });
+    }
+
+    private void routeToUserDevices(UUID targetUserId, Frame frame) {
+        try {
+            String frameJson = objectMapper.writeValueAsString(frame);
+            Map<Object, Object> deviceNodeMap = connectionRegistry.getUserActiveNodes(targetUserId);
+
+            deviceNodeMap.forEach((deviceIdStr, targetNodeId) -> {
+                connectionRegistry.routeFrameToNode((String) targetNodeId, frameJson);
+            });
+        } catch (Exception e) {
+            log.error("Failed to route frame to user: {}", targetUserId, e);
+        }
+    }
+
+    private void dispatchToLocalSession(Frame frame) throws IOException {
+        String frameJson = objectMapper.writeValueAsString(frame);
+        TextMessage textMessage = new TextMessage(frameJson);
+
+        for (WebSocketSession session : localSessions.values()) {
+            if (session.isOpen()) {
+                session.sendMessage(textMessage);
+            }
+        }
+    }
+
     private void sendError(WebSocketSession session, String requestId, String errorMsg) throws IOException {
         ErrorPayload errorPayload = new ErrorPayload(errorMsg);
-        Frame errorFrame = new Frame(
-                FrameType.ERROR,
-                requestId,
-                null,
-                objectMapper.writeValueAsString(errorPayload)
-        );
+        Frame errorFrame = new Frame(FrameType.ERROR, requestId, null, objectMapper.writeValueAsString(errorPayload));
         session.sendMessage(new TextMessage(objectMapper.writeValueAsString(errorFrame)));
     }
 
@@ -151,15 +197,14 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         UUID userId = (UUID) session.getAttributes().get("userId");
         UUID deviceId = (UUID) session.getAttributes().get("deviceId");
 
-        if (userId != null && deviceId != null) {
-            Map<UUID, WebSocketSession> devices = activeSessions.get(userId);
-            if (devices != null) {
-                devices.remove(deviceId);
-                if (devices.isEmpty()) {
-                    activeSessions.remove(userId);
-                }
-            }
-            log.info("WebSocket disconnected: User ID: {}, Device ID: {}", userId, deviceId);
+        if (deviceId != null) {
+            localSessions.remove(deviceId);
+            connectionRegistry.unregisterLocalConnection(userId, deviceId);
         }
+
+        if (userId != null && localSessions.isEmpty()) {
+            presenceService.setOffline(userId);
+        }
+        log.info("WebSocket disconnected. User: {}, Device: {}", userId, deviceId);
     }
 }
