@@ -19,4 +19,18 @@ public interface MessageRepository extends JpaRepository<MessageEntity, UUID> {
     List<MessageEntity> findMessagesBefore(@Param("conversationId") UUID conversationId, @Param("beforeId") UUID beforeId, Pageable pageable);
 
     Optional<MessageEntity> findByConversationIdAndSenderIdAndClientMessageId(UUID conversationId, UUID senderId, String clientMessageId);
+
+     @Query("""
+        SELECT m FROM MessageEntity m
+        JOIN ConversationMember cm ON m.conversationId = cm.conversationId
+        WHERE cm.userId = :userId
+          AND m.id > :afterMessageId
+          AND m.senderId != :userId
+        ORDER BY m.id ASC
+        """)
+    List<MessageEntity> findMissedMessagesForUser(
+            @Param("userId") UUID userId,
+            @Param("afterMessageId") UUID afterMessageId,
+            Pageable pageable
+    );
 }

@@ -19,6 +19,7 @@ import org.springframework.web.socket.client.standard.StandardWebSocketClient;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
+import org.springframework.kafka.test.context.EmbeddedKafka;
 
 import java.util.List;
 import java.util.UUID;
@@ -30,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @Testcontainers
+@EmbeddedKafka(partitions = 1, brokerProperties = { "listeners=PLAINTEXT://localhost:9092", "port=9092" })
 public class WebSocketFlowTest {
 
     @Container
