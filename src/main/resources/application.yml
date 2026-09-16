@@ -26,8 +26,27 @@ spring:
     redis:
       host: ${SPRING_REDIS_HOST:localhost}
       port: ${SPRING_REDIS_PORT:6379}
+      
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health, info, metrics, prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: chat-backend
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        chat.message.processing.time: true      
 
 app:
+  rate-limit:
+    auth-limit: ${RATE_LIMIT_AUTH:100} # Increased default limit per minute
+    media-limit: ${RATE_LIMIT_MEDIA:50}
   jwt:
     secret: ${JWT_SECRET:404E635266556A586E3272357538782F413F4428472B4B6250645367566B5970}
     access-token-expiration-ms: 900000 # 15 minutes

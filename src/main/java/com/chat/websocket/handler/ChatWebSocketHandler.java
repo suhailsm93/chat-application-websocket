@@ -4,13 +4,12 @@ import com.chat.common.ratelimit.RedisRateLimiter;
 import com.chat.common.util.UUIDv7Utils;
 import com.chat.conversation.model.ConversationMember;
 import com.chat.conversation.repository.ConversationMemberRepository;
-import com.chat.kafka.event.ChatEvents.DeliveryEvent;
-import com.chat.kafka.event.ChatEvents.MessageCreatedEvent;
-import com.chat.kafka.event.ChatEvents.ReadEvent;
+import com.chat.kafka.event.MessageCreatedEvent;
 import com.chat.kafka.producer.ChatEventProducer;
 import com.chat.message.model.MessageEntity;
 import com.chat.message.repository.MessageRepository;
 import com.chat.presence.service.PresenceService;
+import com.chat.websocket.dto.NodeRoutingEnvelope;
 import com.chat.websocket.dto.WebSocketFrames.*;
 import com.chat.websocket.registry.RedisConnectionRegistry;
 import com.chat.websocket.service.TypingIndicatorService;
@@ -45,16 +44,16 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final RedisRateLimiter rateLimiter;
     private final ChatEventProducer eventProducer;
 
-    private final Map<UUID, WebSocketSession> localSessions = new ConcurrentHashMap<>();
+    // Local active TCP socket connections: deviceId -> WebSocketSession
+    private final Map<String, WebSocketSession> localSessions = new ConcurrentHashMap<>();
 
     @PostConstruct
     public void registerPubSubListener() {
-        connectionRegistry.registerFrameSubscriber("local-handler", (nodeId, frameJson) -> {
+        connectionRegistry.registerEnvelopeSubscriber("local-handler", envelope -> {
             try {
-                Frame frame = objectMapper.readValue(frameJson, Frame.class);
-                dispatchToLocalSession(frame);
+                dispatchToTargetLocalSession(envelope.targetDeviceId().toString(), envelope.frameJson());
             } catch (Exception e) {
-                log.error("Error dispatching pub/sub frame locally: ", e);
+                log.error("Error dispatching envelope locally: ", e);
             }
         });
     }
@@ -65,14 +64,37 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         UUID deviceId = (UUID) session.getAttributes().get("deviceId");
 
         if (deviceId != null) {
-            localSessions.put(deviceId, session);
+            localSessions.put(deviceId.toString(), session);
             connectionRegistry.registerLocalConnection(userId, deviceId);
-        }
-        if (userId != null) {
             presenceService.heartbeat(userId);
+            broadcastPresence(userId, true);
+            log.info("WebSocket connected successfully. User: {}, Device: {}", userId, deviceId);
+        } else {
+            log.warn("WebSocket connected, but missing deviceId in session attributes.");
         }
+    }
 
-        log.info("WebSocket connected. User: {}, Device: {}", userId, deviceId);
+    private void broadcastPresence(UUID userId, boolean isOnline) {
+        try {
+            // Find all conversations this user belongs to
+            memberRepository.findByUserId(userId).forEach(member -> {
+                Frame presenceFrame = new Frame(
+                        FrameType.PRESENCE_CHANGED,
+                        null,
+                        member.getConversationId(),
+                        "{\"userId\":\"" + userId + "\",\"isOnline\":" + isOnline + "}"
+                );
+                
+                // Push update to all other members in that chat
+                memberRepository.findByConversationId(member.getConversationId()).forEach(m -> {
+                    if (!m.getUserId().equals(userId)) {
+                        routeToUserDevices(m.getUserId(), presenceFrame);
+                    }
+                });
+            });
+        } catch (Exception e) {
+            log.error("Failed to broadcast presence update for user {}", userId, e);
+        }
     }
 
     @Override
@@ -94,14 +116,12 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         try {
             switch (frame.type()) {
                 case MESSAGE_SEND -> handleMessageSend(session, userId, deviceId, frame);
-                case ACK_DELIVERY -> handleAckDelivery(userId, frame);
-                case ACK_READ -> handleAckRead(userId, frame);
                 case TYPING_START -> handleTyping(userId, frame, true);
                 case TYPING_STOP -> handleTyping(userId, frame, false);
                 default -> log.warn("Unhandled frame type: {}", frame.type());
             }
         } catch (Exception e) {
-            log.error("Error handling WS frame: ", e);
+            log.error("Error handling WS frame from user {}: ", userId, e);
             sendError(session, frame.requestId(), e.getMessage());
         }
     }
@@ -134,7 +154,7 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
         messageRepository.save(messageEntity);
 
-        // 1. Immediate ACK to sender
+        // 1. Immediate ACK back to the sender device
         MessageAckPayload ackPayload = new MessageAckPayload(
                 messageId, frame.conversationId(), payload.clientMessageId(), now, "SENT"
         );
@@ -143,12 +163,13 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         );
         session.sendMessage(new TextMessage(objectMapper.writeValueAsString(ackFrame)));
 
+        // 2. Self-Sync: Dispatch MESSAGE_NEW mirror frame to sender's OTHER devices
         Frame mirrorFrame = new Frame(
                 FrameType.MESSAGE_NEW, null, frame.conversationId(), objectMapper.writeValueAsString(messageEntity)
         );
         routeToUserDevicesExceptOrigin(senderId, senderDeviceId, mirrorFrame);
 
-        // 2. Publish to Kafka Backbone with partition key = conversation_id
+        // 3. Publish to Kafka Backbone for recipient delivery
         MessageCreatedEvent kafkaEvent = new MessageCreatedEvent(
                 messageId,
                 frame.conversationId(),
@@ -160,18 +181,6 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                 now
         );
         eventProducer.publishMessageCreated(kafkaEvent);
-    }
-
-    private void handleAckDelivery(UUID recipientId, Frame frame) {
-        UUID messageId = UUID.fromString(frame.payloadJson().replace("\"", "").trim());
-        DeliveryEvent deliveryEvent = new DeliveryEvent(messageId, frame.conversationId(), recipientId, Instant.now());
-        eventProducer.publishDeliveryReceipt(deliveryEvent);
-    }
-
-    private void handleAckRead(UUID readerId, Frame frame) {
-        UUID messageId = UUID.fromString(frame.payloadJson().replace("\"", "").trim());
-        ReadEvent readEvent = new ReadEvent(messageId, frame.conversationId(), readerId, Instant.now());
-        eventProducer.publishReadReceipt(readEvent);
     }
 
     private void handleTyping(UUID userId, Frame frame, boolean isTyping) throws IOException {
@@ -191,16 +200,18 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         });
     }
 
-    private void routeToUserDevices(UUID targetUserId, Frame frame) {
+    public void routeToUserDevices(UUID targetUserId, Frame frame) {
         try {
             String frameJson = objectMapper.writeValueAsString(frame);
             Map<Object, Object> deviceNodeMap = connectionRegistry.getUserActiveNodes(targetUserId);
 
             deviceNodeMap.forEach((deviceIdStr, targetNodeId) -> {
-                connectionRegistry.routeFrameToNode((String) targetNodeId, frameJson);
+                UUID targetDeviceId = UUID.fromString((String) deviceIdStr);
+                NodeRoutingEnvelope envelope = new NodeRoutingEnvelope(targetDeviceId, frameJson);
+                connectionRegistry.routeEnvelopeToNode((String) targetNodeId, envelope);
             });
         } catch (Exception e) {
-            log.error("Failed to route frame to user: {}", targetUserId, e);
+            log.error("Failed routing frame to user: {}", targetUserId, e);
         }
     }
 
@@ -211,22 +222,20 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
             deviceNodeMap.forEach((deviceIdStr, targetNodeId) -> {
                 if (!deviceIdStr.equals(originDeviceId.toString())) {
-                    connectionRegistry.routeFrameToNode((String) targetNodeId, frameJson);
+                    UUID targetDeviceId = UUID.fromString((String) deviceIdStr);
+                    NodeRoutingEnvelope envelope = new NodeRoutingEnvelope(targetDeviceId, frameJson);
+                    connectionRegistry.routeEnvelopeToNode((String) targetNodeId, envelope);
                 }
             });
         } catch (Exception e) {
-            log.error("Failed routing frame to secondary devices of user {}", userId, e);
+            log.error("Failed routing envelope to secondary devices of user {}", userId, e);
         }
     }
 
-    private void dispatchToLocalSession(Frame frame) throws IOException {
-        String frameJson = objectMapper.writeValueAsString(frame);
-        TextMessage textMessage = new TextMessage(frameJson);
-
-        for (WebSocketSession session : localSessions.values()) {
-            if (session.isOpen()) {
-                session.sendMessage(textMessage);
-            }
+    private void dispatchToTargetLocalSession(String targetDeviceId, String frameJson) throws IOException {
+        WebSocketSession session = localSessions.get(targetDeviceId);
+        if (session != null && session.isOpen()) {
+            session.sendMessage(new TextMessage(frameJson));
         }
     }
 
@@ -242,12 +251,13 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         UUID deviceId = (UUID) session.getAttributes().get("deviceId");
 
         if (deviceId != null) {
-            localSessions.remove(deviceId);
+            localSessions.remove(deviceId.toString());
             connectionRegistry.unregisterLocalConnection(userId, deviceId);
         }
 
-        if (userId != null && localSessions.isEmpty()) {
+        if (userId != null && connectionRegistry.getUserActiveNodes(userId).isEmpty()) {
             presenceService.setOffline(userId);
+            broadcastPresence(userId, false);
         }
         log.info("WebSocket disconnected. User: {}, Device: {}", userId, deviceId);
     }

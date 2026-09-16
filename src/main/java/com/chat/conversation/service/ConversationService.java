@@ -3,6 +3,7 @@ package com.chat.conversation.service;
 import com.chat.common.exception.BadRequestException;
 import com.chat.common.exception.ResourceNotFoundException;
 import com.chat.conversation.model.ConversationEntity;
+import com.chat.conversation.model.ConversationEntity.ConversationType;
 import com.chat.conversation.model.ConversationMember;
 import com.chat.conversation.repository.ConversationMemberRepository;
 import com.chat.conversation.repository.ConversationRepository;
@@ -31,7 +32,7 @@ public class ConversationService {
             throw new ResourceNotFoundException("Target user not found");
         }
 
-        return conversationRepository.findDirectConversationBetweenUsers(currentUserId, targetUserId)
+        return conversationRepository.findDirectConversationBetweenUsers(currentUserId, targetUserId, ConversationType.DIRECT)
                 .orElseGet(() -> {
                     ConversationEntity conv = ConversationEntity.builder()
                             .type(ConversationEntity.ConversationType.DIRECT)

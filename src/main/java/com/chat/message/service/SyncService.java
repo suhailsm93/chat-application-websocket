@@ -1,6 +1,6 @@
 package com.chat.message.service;
 
-import com.chat.kafka.event.ChatEvents.DeliveryEvent;
+import com.chat.kafka.event.DeliveryEvent;
 import com.chat.kafka.producer.ChatEventProducer;
 import com.chat.message.dto.SyncDtos.SyncResponse;
 import com.chat.message.model.MessageEntity;

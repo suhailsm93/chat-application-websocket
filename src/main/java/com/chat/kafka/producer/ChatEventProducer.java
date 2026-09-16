@@ -1,5 +1,7 @@
 package com.chat.kafka.producer;
-
+import com.chat.kafka.event.MessageCreatedEvent;
+import com.chat.kafka.event.DeliveryEvent;
+import com.chat.kafka.event.ReadEvent;
 import com.chat.kafka.event.ChatEvents.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;

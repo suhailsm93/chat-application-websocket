@@ -17,6 +17,7 @@ public class WebSocketFrames {
         // Server to Client
         MESSAGE_ACK,
         MESSAGE_NEW,
+        PRESENCE_CHANGED,
         ERROR
     }
 
