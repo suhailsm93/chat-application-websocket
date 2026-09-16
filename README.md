@@ -185,11 +185,110 @@ Import Grafana Dashboard ID **`11378`** for comprehensive Spring Boot statistics
 
 ## 7. Performance Benchmarking with k6
 
-Execute the standard load test using the provided `k6` script:
+To execute the real-time WebSocket messaging test:
 
 ```bash
-docker run --net=host -i --rm grafana/k6 run - <../load-tests/k6-ws-load-test.js
+docker run --net=host -i --rm grafana/k6 run - <load-tests/k6-ws-load-test.js
 ```
+
+<details>
+<summary><b>📄 Click to expand the <code>k6-media-load-test.js</code> Script</b></summary>
+
+```javascript
+import http from 'k6/http';
+import { check, sleep } from 'k6';
+import { Trend, Rate } from 'k6/metrics';
+
+const presignUrlLatency = new Trend('chat_s3_presign_latency_ms');
+const directUploadLatency = new Trend('chat_s3_upload_latency_ms');
+const uploadSuccessRate = new Rate('chat_media_upload_success_rate');
+
+export const options = {
+  stages: [
+    { duration: '10s', target: 5 },
+    { duration: '20s', target: 20 },
+    { duration: '10s', target: 0 },
+  ],
+  thresholds: {
+    'chat_s3_presign_latency_ms': ['p(95)<150'],
+    'chat_s3_upload_latency_ms': ['p(95)<300'],
+    'chat_media_upload_success_rate': ['rate>0.95'],
+  },
+};
+
+const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
+
+export function setup() {
+  console.log('--- Registering Media Tester User ---');
+  const username = `media_tester_${Date.now()}`;
+  const res = http.post(`${BASE_URL}/api/auth/register`, JSON.stringify({
+    username: username,
+    email: `${username}@loadtest.local`,
+    password: 'Password123!',
+    displayName: 'Media Tester',
+    deviceName: 'k6-media-node',
+    deviceType: 'BENCHMARK'
+  }), { headers: { 'Content-Type': 'application/json' } });
+
+  if (res.status === 200) {
+    return { token: res.json('accessToken') };
+  }
+  console.error('Failed to setup user:', res.body);
+  return { token: null };
+}
+
+export default function (data) {
+  if (!data.token) {
+    sleep(1);
+    return;
+  }
+
+  const authHeaders = {
+    'Content-Type': 'application/json',
+    'Authorization': `Bearer ${data.token}`
+  };
+
+  const presignStart = Date.now();
+  const payload = JSON.stringify({
+    fileName: `test_file_${__VU}_${__ITER}.jpg`,
+    contentType: 'image/jpeg',
+    fileSize: 51200
+  });
+
+  const presignRes = http.post(`${BASE_URL}/api/media/upload-url`, payload, { headers: authHeaders });
+  presignUrlLatency.add(Date.now() - presignStart);
+
+  const isPresignedOk = check(presignRes, {
+    'Presigned URL generated (200)': (r) => r.status === 200,
+    'Has uploadUrl': (r) => r.json('uploadUrl') !== undefined
+  });
+
+  if (!isPresignedOk) {
+    uploadSuccessRate.add(false);
+    sleep(1);
+    return;
+  }
+
+  const uploadUrl = presignRes.json('uploadUrl');
+  const dummyFileContent = 'a'.repeat(51200);
+
+  const uploadStart = Date.now();
+  const uploadRes = http.put(uploadUrl, dummyFileContent, {
+    headers: { 'Content-Type': 'image/jpeg' }
+  });
+  directUploadLatency.add(Date.now() - uploadStart);
+
+  const isUploadOk = check(uploadRes, {
+    'Direct S3 PUT Succeeded (200)': (r) => r.status === 200
+  });
+
+  uploadSuccessRate.add(isUploadOk);
+  sleep(1);
+}
+```
+</details>
+
+---
 
 ### SLA Targets Under Load
 * **Handshake connection speed:** `< 50ms`
